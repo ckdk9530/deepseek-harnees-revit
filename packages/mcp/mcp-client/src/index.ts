@@ -33,6 +33,12 @@ export const inject = ['tools']
 /** Default timeout for individual MCP tool calls (ms). */
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000
 
+/** Default model-context budget for an explicitly expanded structured result. */
+const DEFAULT_STRUCTURED_CONTENT_MAX_INLINE_BYTES = 16_384
+
+/** Safety ceiling for one expanded structured-result projection. */
+const MAX_STRUCTURED_CONTENT_INLINE_BYTES = 1_048_576
+
 /** Valid `serverName`, kept below the public tool-name budget. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 
@@ -66,6 +72,8 @@ export interface StdioConfig {
   cwd: string
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** UTF-8 byte budget for structured output requested through a tool's responseDetail option. */
+  structuredContentMaxInlineBytes: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -88,6 +96,8 @@ export interface StreamableHttpConfig {
   headers: Record<string, string>
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** UTF-8 byte budget for structured output requested through a tool's responseDetail option. */
+  structuredContentMaxInlineBytes: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -113,6 +123,8 @@ export const Config = z.union([
     env: z.dict(String).default({}),
     cwd: z.string().default(''),
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    structuredContentMaxInlineBytes: z.number().step(1).min(256).max(MAX_STRUCTURED_CONTENT_INLINE_BYTES)
+      .default(DEFAULT_STRUCTURED_CONTENT_MAX_INLINE_BYTES),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
   }),
@@ -122,6 +134,8 @@ export const Config = z.union([
     url: z.string().required(),
     headers: z.dict(String).default({}),
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+    structuredContentMaxInlineBytes: z.number().step(1).min(256).max(MAX_STRUCTURED_CONTENT_INLINE_BYTES)
+      .default(DEFAULT_STRUCTURED_CONTENT_MAX_INLINE_BYTES),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
   }),
@@ -138,9 +152,14 @@ export const Config = z.union([
  * @returns startup readiness after connection and initial tool discovery settle.
  */
 export async function apply(ctx: Context, config: Config): Promise<void> {
-  // Fail loud at load: reconnect misconfiguration (including programmatic
-  // construction that bypassed Schemastery) rejects THIS instance before any
-  // effect registers.
+  // Fail loud at load: programmatic construction may bypass Schemastery.
+  if (!Number.isInteger(config.structuredContentMaxInlineBytes)
+    || config.structuredContentMaxInlineBytes < 256
+    || config.structuredContentMaxInlineBytes > MAX_STRUCTURED_CONTENT_INLINE_BYTES) {
+    throw new Error(
+      `mcp-client(${config.serverName}): structuredContentMaxInlineBytes must be an integer from 256 through ${MAX_STRUCTURED_CONTENT_INLINE_BYTES} (got ${config.structuredContentMaxInlineBytes})`,
+    )
+  }
   const reconnect = resolveReconnectPolicy(config.reconnect, `mcp-client(${config.serverName}): reconnect`)
 
   // Reserve the namespace next: a duplicate `serverName` fails THIS instance

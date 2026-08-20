@@ -409,6 +409,13 @@ export interface ConnectionConfig {
    * that is not a bare, canonical authority fails the plugin load.
    */
   trustedHosts?: string[]
+  /**
+   * Allow trusted non-loopback authorities to use the settings, credentials,
+   * and draft model-discovery methods. This exposes configuration and
+   * write-only credential inputs to every client on the trusted network, so
+   * unauthenticated deployments must opt in explicitly.
+   */
+  allowRemoteConfiguration?: boolean
   /** Maximum buffered JSON body for every `/api` request. */
   maxRequestBodyBytes?: number
 }
@@ -1364,6 +1371,8 @@ export interface StdioConfig {
   cwd: string
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** UTF-8 byte budget for structured output requested through a tool's responseDetail option. */
+  structuredContentMaxInlineBytes: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
@@ -1386,6 +1395,8 @@ export interface StreamableHttpConfig {
   headers: Record<string, string>
   /** Per-tool-call timeout in milliseconds. */
   toolCallTimeoutMs: number
+  /** UTF-8 byte budget for structured output requested through a tool's responseDetail option. */
+  structuredContentMaxInlineBytes: number
   /** Fail plugin activation when the initial connection or tool synchronization fails. */
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */

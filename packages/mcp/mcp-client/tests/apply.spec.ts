@@ -82,6 +82,7 @@ const stdioConfig: Config = {
   env: {},
   cwd: '',
   toolCallTimeoutMs: 60_000,
+  structuredContentMaxInlineBytes: 16_384,
   failOnStartupError: false,
 }
 
@@ -123,6 +124,19 @@ describe('mcp-client plugin module exports', () => {
       command: 'echo',
     } as never)
     expect(resolved.serverName).toBe('github-prod_1')
+    expect(resolved.structuredContentMaxInlineBytes).toBe(16_384)
+  })
+
+  it('Config schema bounds the structured-result inline budget', () => {
+    expect(() => ConfigSchema({
+      transport: 'stdio', serverName: 'srv', command: 'echo', structuredContentMaxInlineBytes: 255,
+    } as never)).toThrow()
+    expect(() => ConfigSchema({
+      transport: 'stdio', serverName: 'srv', command: 'echo', structuredContentMaxInlineBytes: 1_048_577,
+    } as never)).toThrow()
+    expect(ConfigSchema({
+      transport: 'stdio', serverName: 'srv', command: 'echo', structuredContentMaxInlineBytes: 32_768,
+    } as never).structuredContentMaxInlineBytes).toBe(32_768)
   })
 
   it('Config schema materializes reconnect defaults and merges partial overrides', () => {
@@ -169,6 +183,12 @@ describe('apply (plugin lifecycle)', () => {
     })
     mockCallTool.mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] })
     ctx = await mountRegistry()
+  })
+
+  it('rejects a programmatically constructed invalid structured-result budget before connecting', async () => {
+    await expect(apply(ctx, { ...stdioConfig, structuredContentMaxInlineBytes: 12.5 }))
+      .rejects.toThrow('structuredContentMaxInlineBytes must be an integer from 256 through 1048576')
+    expect(mockConnect).not.toHaveBeenCalled()
   })
 
   it('connects, syncs tools under the namespace, and registers a notification handler', async () => {
@@ -392,6 +412,7 @@ describe('apply (plugin lifecycle)', () => {
       url: 'http://localhost:3000/mcp',
       headers: { Authorization: 'Bearer x' },
       toolCallTimeoutMs: 30_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
 

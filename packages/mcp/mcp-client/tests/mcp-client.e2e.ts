@@ -105,6 +105,7 @@ describe('fixture server — controlled scenarios', () => {
     env: {},
     cwd: packageDir,
     toolCallTimeoutMs: 15_000,
+    structuredContentMaxInlineBytes: 16_384,
     failOnStartupError: false,
   }
 
@@ -125,6 +126,7 @@ describe('fixture server — controlled scenarios', () => {
     const names = schemas.map(s => s.name)
     expect(names).toContain('mcp__fixture__add')
     expect(names).toContain('mcp__fixture__greet')
+    expect(names).toContain('mcp__fixture__inspect')
     expect(names).toContain('mcp__fixture__fail')
     expect(names).toContain('mcp__fixture__image')
     // Raw names are not registered.
@@ -162,6 +164,18 @@ describe('fixture server — controlled scenarios', () => {
     })
     expect(result.isError).toBe(false)
     expect(result.content[0]).toEqual({ type: 'text', text: 'Hello, World!' })
+  })
+
+  it('lets the model expand structured output on the same real MCP call', async () => {
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__fixture__inspect', arguments: { responseDetail: 'full' },
+    })
+    expect(result.isError).toBe(false)
+    expect(result.content).toEqual([
+      { type: 'text', text: 'inspect ok' },
+      { type: 'text', text: 'Structured MCP result:\n```json\n{\n  "answer": 42,\n  "state": "ready"\n}\n```' },
+    ])
   })
 
   it('executes fail() → isError result', async () => {
@@ -204,6 +218,7 @@ describe('fixture server — duplicate serverName', () => {
       env: {},
       cwd: packageDir,
       toolCallTimeoutMs: 15_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     await apply(ctx, config)
@@ -226,6 +241,7 @@ describe('fixture server — disposal', () => {
       env: {},
       cwd: packageDir,
       toolCallTimeoutMs: 15_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     })
 
@@ -249,6 +265,7 @@ describe('fixture server — crash recovery', () => {
       env: {},
       cwd: packageDir,
       toolCallTimeoutMs: 15_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
       reconnect,
     }
@@ -333,6 +350,7 @@ describe('server-everything — official test server', () => {
     env: {},
     cwd: '',
     toolCallTimeoutMs: 30_000,
+    structuredContentMaxInlineBytes: 16_384,
     failOnStartupError: false,
   }
 
@@ -402,6 +420,7 @@ describe('server-filesystem — real filesystem operations', () => {
       env: {},
       cwd: '',
       toolCallTimeoutMs: 30_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     await apply(ctx, config)
@@ -519,6 +538,7 @@ describe('streamable-http — in-process MCP server', () => {
       url: baseUrl,
       headers: { Authorization: 'Bearer e2e-test-token' },
       toolCallTimeoutMs: 15_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     await apply(ctx, config)

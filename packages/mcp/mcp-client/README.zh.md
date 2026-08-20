@@ -44,6 +44,7 @@ MCP 客户端桥接插件：连接外部 [Model Context Protocol](https://modelc
 | `url` | http | 是 | MCP 服务器 URL |
 | `headers` | http | 否 | 额外标头（例如认证 token） |
 | `toolCallTimeoutMs` | 两者 | 否 | 每次 `callTool` 调用的超时（默认 60000） |
+| `structuredContentMaxInlineBytes` | 两者 | 否 | 通过 `responseDetail: "full"` 明确请求结构化输出时的 UTF-8 字节预算（默认 16384；范围 256–1048576） |
 | `failOnStartupError` | 两者 | 否 | 初始连接或工具同步失败时拒绝插件激活（默认 `false`） |
 | `reconnect.enabled` | 两者 | 否 | 连接丢失后自动重新连接（默认 `true`） |
 | `reconnect.initialDelayMs` | 两者 | 否 | 首次重连延迟（毫秒）；每次连续失败尝试翻倍（默认 500） |
@@ -65,6 +66,8 @@ MCP 客户端桥接插件：连接外部 [Model Context Protocol](https://modelc
 - 监听 `notifications/tools/list_changed` → 重新同步；获取阶段失败时保留上一世代的注册，注册冲突则会回滚本次尝试的世代，并且不保留该服务器的任何工具。
 - 工具执行：`client.callTool({ name: rawName, arguments }, { signal })`，支持超时 + 中止；公开名称绝不会发给服务器。
 - 规范成功值是 `{ content: JsonValue[], structuredContent? }`；完整的 JSON MCP 块会保留给编程调用方。受支持且已声明的 `outputSchema` 会验证 `structuredContent`；不受支持的 schema 词汇会回退为不受约束的 `JsonValue`。
+- 每个已发现工具都会增加一个仅由 host 使用的 `responseDetail: "summary" | "full"` 参数；若服务器已占用该属性，则使用第一个可用的确定性数字后缀。该参数会在 `tools/call` 前移除。默认 `summary`；`full` 会把同一次调用的格式化 `structuredContent` 附加到模型投影，但不改变规范 MCP 值。
+- 展开的结构化输出受 `structuredContentMaxInlineBytes` 限制。超大 JSON 会通过可选的 `ctx.spillStore` 保存，并替换为有界的头尾预览及读取指引；没有存储或 session owner 时，预览会说明完整值仍只对编程调用方可用。
 - Native／模型渲染会保留 MCP 块顺序。文本类连续块以换行连接；资源链接以文本保留名称和 URI；只有挂载 `ctx.attachments` 且确切调用模型路由明确声明支持图片输入时，受支持的图片才会成为持久核心图片块。整个图片批次会先完成解码与准入，再保存任一成员。格式错误或被拒绝的图片批次、音频、嵌入资源和不受支持的块会成为明确诊断文本，而不会消失。
 - 断开／崩溃时：supervisor 以指数退避（`reconnect.initialDelayMs` 逐次翻倍，上限 `reconnect.maxDelayMs`）重启原始服务器配置，成功后重新执行发现——恢复的世代会替换前一个，因此工具既不会重复也不会泄漏。中断期间最后一个正常世代保持注册；针对它的调用在恢复前会失败。
 - 重连按中断预算控制：连续失败达到 `reconnect.maxAttempts` 次后，该服务器的工具会被注销，重连停止，直到 HMR 重载或重启 Host。连接存活超过 `maxDelayMs` 会重置预算，因此偶尔崩溃的服务器可以无限恢复，而崩溃循环的服务器——即使短暂连接成功——仍会耗尽上限而非永远重启。
@@ -77,6 +80,7 @@ MCP 客户端桥接插件：连接外部 [Model Context Protocol](https://modelc
 | `ctx.tools` | 注册／注销 MCP 工具 |
 | `ctx.attachments` | 可选；在模型投影前校验并持久保存图片结果批次 |
 | `ctx.llm` | 可选；证明确切调用路由明确支持图片输入 |
+| `ctx.spillStore` | 可选；持久保存超过内联投影预算的结构化 JSON |
 
 ## 模型体验
 
@@ -84,11 +88,11 @@ MCP 客户端桥接插件：连接外部 [Model Context Protocol](https://modelc
 
 #### 模型看到的内容
 
-初始发现成功后，每个已声明的 MCP 工具都会显示为名为 `mcp__<serverName>__<rawName>`（或其确定性规范化形式）的原生工具，并携带服务器提供的描述和输入 schema。成功的重新同步——包括自动重连后的同步——会替换整个世代；对插件执行 dispose（资源释放）或重连预算耗尽会移除该世代。
+初始发现成功后，每个已声明的 MCP 工具都会显示为名为 `mcp__<serverName>__<rawName>`（或其确定性规范化形式）的原生工具，并携带服务器提供的描述、输入 schema 和一个 host 专用的 `responseDetail` 选项。模型在普通调用中保留 `summary`，并在当前任务需要该次调用的结构化输出时选择 `full`。成功的重新同步——包括自动重连后的同步——会替换整个世代；对插件执行 dispose（资源释放）或重连预算耗尽会移除该世代。
 
 #### Token 影响
 
-工具注册期间，每次请求都会承担数据相关的 schema 成本。重新同步会替换而非累积 schema，服务器限定名称也会为每个工具定义和调用增加 token。
+工具注册期间，每次请求都会承担数据相关的 schema 成本。每个工具还会携带体积很小且稳定的 `responseDetail` enum。重新同步会替换而非累积 schema，服务器限定名称也会为每个工具定义和调用增加 token。
 
 #### KV Cache 影响
 
@@ -98,11 +102,11 @@ MCP 客户端桥接插件：连接外部 [Model Context Protocol](https://modelc
 
 #### 模型看到的内容
 
-公开工具名称和 JSON 参数会保留在 assistant 历史中。执行局部的规范值始终为程序化调用方和 Code Mode 保留完整 JSON MCP 块及可选结构化内容。在 Native 上下文中，受支持的图片块会在确切路由能力得到证明后，按原始顺序与文本一起持久投影；Code Mode 还会经外层 `run_code` 结果转运这份已经结算的丰富投影，而不改变规范绑定值。被拒绝的图片、音频、嵌入资源、资源链接和未知块会继续以有界文本诊断可见；MCP `isError` 会在持久化图片前拒绝调用。
+公开工具名称和 JSON 参数会保留在 assistant 历史中。执行局部的规范值始终为程序化调用方和 Code Mode 保留完整 JSON MCP 块及可选结构化内容。在 Native 上下文中，`responseDetail: "full"` 会加入该次调用的有界结构化 JSON 投影；存储可用时，超大 JSON 会包含 spill 读取路径。受支持的图片块会在确切路由能力得到证明后，按原始顺序与文本一起持久投影；Code Mode 还会经外层 `run_code` 结果转运这份已经结算的丰富投影，而不改变规范绑定值。被拒绝的图片、音频、嵌入资源、资源链接和未知块会继续以有界文本诊断可见；MCP `isError` 会在持久化图片前拒绝调用。
 
 #### Token 影响
 
-参数、映射后的文本和持久图片引用会保留到压缩（compaction）发生时。内联 MCP base64 只存在于执行局部的规范值中，绝不会复制进会话事件；提供方会从附件存储读取经过校验的字节。音频和嵌入资源载荷仍不会进入模型上下文。
+参数、映射后的文本、明确展开的结构化 JSON（或其有界预览和 spill locator）及持久图片引用会保留到压缩（compaction）发生时。摘要调用不承担结构化结果的 token 成本。内联 MCP base64 只存在于执行局部的规范值中，绝不会复制进会话事件；提供方会从附件存储读取经过校验的字节。音频和嵌入资源载荷仍不会进入模型上下文。
 
 #### KV Cache 影响
 
@@ -113,5 +117,5 @@ MCP 客户端桥接插件：连接外部 [Model Context Protocol](https://modelc
 - **只桥接 MCP 的工具能力**：资源和提示词没有 harness 消费接口，暂缓实现。
 - **启动超时继承自 MCP SDK**：DSH 尚未公开连接／发现超时。每次 initialize 请求或分页 `tools/list` 请求都使用 SDK 默认的 60 秒，因此在初始同步完成期间，无响应的 server 或 cursor chain 可能同时延迟激活与 teardown。
 - **重连在传输关闭时触发**：崩溃的 stdio 子进程会触发重连；Streamable HTTP 失败通过每次请求以及 SDK 传输自身的 SSE（Server-Sent Events）流恢复机制暴露，因此不可达的 HTTP 服务器会按调用重试，而非由 supervisor 重新 spawn。
-- **图片是唯一的持久丰富结果桥接**：PNG、JPEG、WebP 和 GIF 可以在确切能力得到证明后进入 Native 上下文。音频和嵌入资源载荷仍只存在于执行局部，并配有明确诊断；资源链接只以文本保留名称和 URI。
+- **音频和嵌入资源仍只存在于执行局部**：PNG、JPEG、WebP 和 GIF 可在确切能力证明后进入 Native 上下文，请求的结构化 JSON 也可以有界文本或 spill 引用进入。音频仍只有诊断文本，资源链接只以文本保留名称和 URI。
 - **不强制执行不受支持的 MCP 输出 schema**：已声明 schema 使用 harness 子集之外的词汇时，`structuredContent` 会回退到 `JsonValue`。

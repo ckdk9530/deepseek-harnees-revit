@@ -11,6 +11,7 @@ import type {
 } from '@deepseek-ai/dsh-client-modules/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { BootPage } from './boot-page.ts'
+import { installBrowserCryptoCompatibility } from './browser-crypto.ts'
 import { getStaticModules } from './seed.ts'
 import { STATE_LABELS } from './loader-status.ts'
 import './base.css'
@@ -45,6 +46,7 @@ export class AppWebEntry {
    */
   async run(): Promise<void> {
     try {
+      installBrowserCryptoCompatibility()
       const win = globalThis as DshWindow
       const moduleLoader = win.__ModuleLoader__
       if (moduleLoader === undefined) {

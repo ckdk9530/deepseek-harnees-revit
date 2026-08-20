@@ -16,6 +16,8 @@ The HTTP carrier also hides the bind address inside `startWebServer()`, so alter
 
 `WebServerOptions.host` is required. The HTTP carrier passes that value to `node:http` without supplying a fallback, leaving each shell responsible for its bind policy. Programmatic carrier consumers may select another hostname or address directly.
 
+The Web shell installs an RFC 4122 version 4 `crypto.randomUUID()` implementation from `crypto.getRandomValues()` before loading client plugins when a non-secure LAN HTTP origin omits the native method. Secure origins retain the browser implementation. This keeps the same client graph usable on the advertised LAN URL without weakening UUID entropy.
+
 ## Alternatives considered
 
 **Keep `0.0.0.0` as the default.** Rejected because ordinary same-machine use does not need network-wide reachability and should not acquire it implicitly.
@@ -26,4 +28,4 @@ The HTTP carrier also hides the bind address inside `startWebServer()`, so alter
 
 ## Consequences
 
-Local `dsh web` starts remain reachable at `http://127.0.0.1:3080`; a browser on another machine must opt in with `dsh web --host 0.0.0.0`. The CLI does not yet expose custom interface addresses or IPv6 modes, while programmatic carrier consumers retain that flexibility. Server tests pin both loopback and all-interface forwarding into the Node listen boundary, and the web smoke continues to exercise the default CLI path.
+Local `dsh web` starts remain reachable at `http://127.0.0.1:3080`; a browser on another machine must opt in with `dsh web --host 0.0.0.0`. The CLI does not yet expose custom interface addresses or IPv6 modes, while programmatic carrier consumers retain that flexibility. Server tests pin both loopback and all-interface forwarding into the Node listen boundary. The assembled browser test maps a non-localhost HTTP origin to the scaffold and verifies provider discovery starts with the UUID compatibility installed.

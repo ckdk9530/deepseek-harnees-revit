@@ -101,6 +101,7 @@ function stdioConfig(reconnect?: Config['reconnect']): Config {
     env: {},
     cwd: '',
     toolCallTimeoutMs: 60_000,
+    structuredContentMaxInlineBytes: 16_384,
     failOnStartupError: false,
     ...reconnect === undefined ? {} : { reconnect },
   }

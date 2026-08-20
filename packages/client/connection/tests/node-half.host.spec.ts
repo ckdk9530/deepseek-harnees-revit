@@ -74,7 +74,7 @@ function fakeResponse(): { response: ServerResponse; state: { status?: number; b
   return { response, state }
 }
 
-async function mounted(config?: { trustedHosts?: string[] }): Promise<{
+async function mounted(config?: { trustedHosts?: string[]; allowRemoteConfiguration?: boolean }): Promise<{
   routes: WebRoute[]
   upgrades: WebUpgradeRoute[]
   dispose: () => Promise<void>
@@ -189,6 +189,37 @@ describe('connection node half', () => {
     const read = fakeResponse()
     await routes[0]!.handler(fakeRequest({ host: 'harness.example' }), read.response)
     expect(read.state.status).not.toBe(403)
+    await dispose()
+  })
+
+  it('allows only the configuration plane when a trusted deployment opts in', async () => {
+    const { routes, dispose } = await mounted({
+      trustedHosts: ['harness.example'],
+      allowRemoteConfiguration: true,
+    })
+    for (const method of [
+      'settings.describe', 'settings.openDocument', 'settings.update', 'settings.replace', 'settings.mutate',
+      'credentials.describe', 'credentials.set', 'credentials.unset',
+      'llm.discoverModels',
+    ]) {
+      const allowed = fakeResponse()
+      await routes[0]!.handler(
+        fakeRequest({ host: 'harness.example' }, `${API_PATH}/${method}`),
+        allowed.response,
+      )
+      expect(allowed.state.status).not.toBe(403)
+    }
+    for (const method of [
+      'host.pickDirectory', 'host.openPath',
+      'agentPreset.read', 'agentPreset.copy', 'agentPreset.openDocument', 'agentPreset.remove',
+    ]) {
+      const denied = fakeResponse()
+      await routes[0]!.handler(
+        fakeRequest({ host: 'harness.example' }, `${API_PATH}/${method}`),
+        denied.response,
+      )
+      expect(denied.state.status).toBe(403)
+    }
     await dispose()
   })
 
@@ -487,6 +518,33 @@ describe('connection node half over a real HTTP server', () => {
       }
       // Loopback reaches everything, configuration included.
       expect(await call(port, 'settings.describe', `127.0.0.1:${String(port)}`)).toBe(404)
+    } finally {
+      await close()
+      await dispose()
+    }
+  })
+
+  it('serves opted-in configuration methods to a declared LAN authority over real HTTP', async () => {
+    const { routes, dispose } = await mounted({
+      trustedHosts: ['harness.example'],
+      allowRemoteConfiguration: true,
+    })
+    const { port, close } = await serve(routes)
+    try {
+      for (const method of [
+        'settings.describe', 'settings.openDocument', 'settings.update', 'settings.replace', 'settings.mutate',
+        'credentials.describe', 'credentials.set', 'credentials.unset',
+        'llm.discoverModels',
+      ]) {
+        expect([method, await call(port, method, 'harness.example')]).toEqual([method, 404])
+      }
+      for (const method of [
+        'host.pickDirectory', 'host.openPath',
+        'agentPreset.read', 'agentPreset.copy', 'agentPreset.openDocument', 'agentPreset.remove',
+      ]) {
+        expect([method, await call(port, method, 'harness.example')]).toEqual([method, 403])
+      }
+      expect(await call(port, 'settings.describe', 'undeclared.example')).toBe(403)
     } finally {
       await close()
       await dispose()

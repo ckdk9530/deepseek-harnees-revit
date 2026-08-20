@@ -21,6 +21,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { isImageAdmissionError } from '@deepseek-ai/dsh-attachment'
 import type { AttachmentStore, ImageAttachmentRef, ImageMediaType, SaveImageAttachment } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { TextRetainer } from '@deepseek-ai/dsh-output-retention'
+import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
 import type { ToolDefinition, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { JsonSchemaNode, JsonValue } from '@deepseek-ai/dsh-tools'
@@ -30,6 +32,8 @@ export interface ToolBridgeOptions {
   /** Whether a registry conflict is contained or rejects this synchronization. */
   registrationFailure: 'contain' | 'throw'
   serverName: string
+  /** Maximum UTF-8 bytes added to model context for one expanded structured result. */
+  structuredContentMaxInlineBytes: number
   toolCallTimeoutMs: number
 }
 
@@ -56,6 +60,15 @@ const HASH_LENGTH = 12
 
 /** Raw result record: the bridge owns JSON-value validation after transport. */
 const RawCallToolResultSchema = z.record(z.string(), z.unknown())
+
+/** Model-selectable projection level for one MCP call. */
+type ResponseDetail = 'summary' | 'full'
+
+/** Base model-facing argument name; collisions receive a deterministic numeric suffix. */
+const RESPONSE_DETAIL_PARAMETER = 'responseDetail'
+
+/** Model-facing guidance for the host-only projection argument. */
+const RESPONSE_DETAIL_DESCRIPTION = 'Choose full when the task needs the complete structured result; summary keeps the server\'s normal concise result.'
 
 /** Raster formats supported by the durable attachment vocabulary. */
 const IMAGE_MEDIA_TYPES: readonly ImageMediaType[] = [
@@ -217,6 +230,46 @@ interface PreparedProjection {
   content: ContentBlock[]
 }
 
+/** One model-facing input schema plus its host-only projection argument name. */
+interface ModelParameters {
+  schema: Record<string, unknown>
+  responseDetailParameter: string
+}
+
+/** Add one collision-safe response-detail argument without mutating the server schema. */
+function addResponseDetailParameter(parameters: Record<string, unknown>): ModelParameters {
+  const declared = isUnknownRecord(parameters.properties) ? parameters.properties : {}
+  let responseDetailParameter = RESPONSE_DETAIL_PARAMETER
+  let suffix = 2
+  while (Object.hasOwn(declared, responseDetailParameter)) {
+    responseDetailParameter = `${RESPONSE_DETAIL_PARAMETER}${suffix}`
+    suffix += 1
+  }
+  return {
+    schema: {
+      ...parameters,
+      properties: {
+        ...declared,
+        [responseDetailParameter]: {
+          type: 'string',
+          enum: ['summary', 'full'],
+          description: RESPONSE_DETAIL_DESCRIPTION,
+        },
+      },
+    },
+    responseDetailParameter,
+  }
+}
+
+/** Split the host projection choice from arguments sent to the MCP server. */
+function splitResponseDetail(
+  args: Record<string, unknown>,
+  responseDetailParameter: string,
+): { detail: ResponseDetail; wireArgs: Record<string, unknown> } {
+  const { [responseDetailParameter]: requested, ...wireArgs } = args
+  return { detail: requested === 'full' ? 'full' : 'summary', wireArgs }
+}
+
 /** Keep a supported advertised schema; unsupported MCP vocabulary falls back to JsonValue. */
 function supportedOutputSchema(candidate: unknown): JsonSchemaNode | undefined {
   if (candidate === undefined) return undefined
@@ -253,12 +306,21 @@ function createDefinition(
   opts: ToolBridgeOptions,
 ): ToolDefinition {
   const projections = new WeakMap<ToolExecution, PreparedProjection>()
+  const modelParameters = addResponseDetailParameter(parameters)
   return {
     name: publicName,
     description,
-    parameters,
+    parameters: modelParameters.schema,
     output: createOutput(rawName, structuredSchema),
-    execute: createExecutor(client, ctx, rawName, taskRequired, opts, projections),
+    execute: createExecutor(
+      client,
+      ctx,
+      rawName,
+      modelParameters.responseDetailParameter,
+      taskRequired,
+      opts,
+      projections,
+    ),
     finalizeContent(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>) {
       const projection = projections.get(exec)
       if (projection === undefined) return undefined
@@ -304,6 +366,7 @@ function createExecutor(
   client: Client,
   ctx: Context,
   rawName: string,
+  responseDetailParameter: string,
   taskRequired: boolean,
   opts: ToolBridgeOptions,
   projections: WeakMap<ToolExecution, PreparedProjection>,
@@ -317,7 +380,8 @@ function createExecutor(
     // string/number/null). Fallback to {} lets the MCP server produce a
     // specific "missing required param" error the model can learn from.
     const argsObj = (typeof args === 'object' && args !== null ? args : {}) as Record<string, unknown>
-    const result = await callToolUncached(client, rawName, argsObj, exec, opts)
+    const { detail, wireArgs } = splitResponseDetail(argsObj, responseDetailParameter)
+    const result = await callToolUncached(client, rawName, wireArgs, exec, opts)
 
     // The SDK may return a legacy `toolResult` shape; normalize to content array.
     if (!Array.isArray(result.content)) {
@@ -326,12 +390,15 @@ function createExecutor(
         : '(no output)'
       const text = typeof rendered === 'string' ? rendered : '(no output)'
       if (result.isError === true) throw new Error(text)
-      return {
+      const value: McpResult = {
         content: [{ type: 'text', text }],
         ...result.structuredContent !== undefined
           ? { structuredContent: result.structuredContent as JsonValue }
           : {},
       }
+      const projection = await prepareResultProjection(ctx, exec, value, rawName, detail, opts)
+      if (projection !== undefined) projections.set(exec, projection)
+      return value
     }
 
     // Trust boundary: the SDK's return type erases to `any[]` due to the
@@ -351,13 +418,91 @@ function createExecutor(
         ? { structuredContent: result.structuredContent as JsonValue }
         : {},
     }
-    if (containsImage(content)) {
-      const fallback: ContentBlock[] = [{ type: 'text', text: extractText(content, rawName) }]
-      const projected = await prepareImageProjection(ctx, exec, content, rawName)
-      projections.set(exec, { value, fallback, content: projected })
-    }
+    const projection = await prepareResultProjection(ctx, exec, value, rawName, detail, opts)
+    if (projection !== undefined) projections.set(exec, projection)
     return value
   }
+}
+
+/** Prepare one execution-local model projection without changing its canonical MCP value. */
+async function prepareResultProjection(
+  ctx: Context,
+  exec: ToolExecution,
+  value: McpResult,
+  rawName: string,
+  detail: ResponseDetail,
+  opts: ToolBridgeOptions,
+): Promise<PreparedProjection | undefined> {
+  const fallback: ContentBlock[] = [{ type: 'text', text: extractText(value.content, rawName) }]
+  let projected = containsImage(value.content)
+    ? await prepareImageProjection(ctx, exec, value.content, rawName)
+    : fallback
+  if (detail === 'full') {
+    const structured = value.structuredContent === undefined
+      ? '[structured result unavailable: the MCP server returned no structuredContent]'
+      : await projectStructuredContent(ctx, exec, value.structuredContent, rawName, opts.structuredContentMaxInlineBytes)
+    projected = [...projected, { type: 'text', text: structured }]
+  }
+  if (isDeepStrictEqual(projected, fallback)) return undefined
+  return { value, fallback, content: projected }
+}
+
+/** Persist oversized structured JSON when the current composition provides spill storage. */
+async function saveStructuredContent(
+  ctx: Context,
+  exec: ToolExecution,
+  rawName: string,
+  json: string,
+): Promise<SpillRef | undefined> {
+  const sessionId = exec.agent?.session.header.id
+  const spillStore = ctx.get('spillStore')
+  if (sessionId === undefined || spillStore === undefined || exec.signal.aborted) return undefined
+  const save: SaveTextSpill = {
+    owner: { sessionId },
+    source: { toolName: exec.name, callId: exec.callId, label: 'structuredContent' },
+    suggestedName: `${rawName}.structured.json`,
+    content: json,
+  }
+  try {
+    return await spillStore.saveText(save)
+  } catch (error: unknown) {
+    ctx.logger.warn(`mcp-client: failed to save structured result for ${exec.name}: ${String(error)}`)
+    return undefined
+  }
+}
+
+/** Keep the head and tail of UTF-8 text within one exact byte budget. */
+function boundedPreview(text: string, maxBytes: number): string {
+  const headBytes = Math.ceil(maxBytes / 2)
+  const tailBytes = Math.floor(maxBytes / 2)
+  const retainer = new TextRetainer({ kind: 'headTail', headBytes, tailBytes })
+  retainer.push(text)
+  return retainer.finish().text
+}
+
+/** Render structured output inline or as a bounded preview plus a durable retrieval path. */
+async function projectStructuredContent(
+  ctx: Context,
+  exec: ToolExecution,
+  structuredContent: JsonValue,
+  rawName: string,
+  maxInlineBytes: number,
+): Promise<string> {
+  const json = JSON.stringify(structuredContent, null, 2)
+  const complete = `Structured MCP result:\n\`\`\`json\n${json}\n\`\`\``
+  if (Buffer.byteLength(complete, 'utf8') <= maxInlineBytes) return complete
+
+  const totalBytes = Buffer.byteLength(json, 'utf8')
+  const ref = await saveStructuredContent(ctx, exec, rawName, json)
+  const notice = ref === undefined
+    ? `(Structured result truncated from ${totalBytes} UTF-8 bytes; full value remains available only to programmatic callers.)`
+    : `(Structured result truncated from ${totalBytes} UTF-8 bytes. Full JSON stored at: ${ref.locator}. ${ref.retrievalHint})`
+  const prefix = `Structured MCP result preview (${totalBytes} UTF-8 bytes):\n`
+  const separator = '\n\n'
+  const fixedBytes = Buffer.byteLength(prefix + separator + notice, 'utf8')
+  if (fixedBytes >= maxInlineBytes) return boundedPreview(prefix + notice, maxInlineBytes)
+  const preview = boundedPreview(json, maxInlineBytes - fixedBytes)
+  return `${prefix}${preview}${separator}${notice}`
 }
 
 /** Whether an untrusted MCP content array contains a declared image block. */
@@ -365,9 +510,14 @@ function containsImage(content: JsonValue[]): boolean {
   return content.some(value => isRecord(value) && value.type === 'image')
 }
 
+/** Narrow an untrusted value to a string-keyed object. */
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 /** Narrow one JSON value to a string-keyed object. */
 function isRecord(value: JsonValue): value is { [key: string]: JsonValue } {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+  return isUnknownRecord(value)
 }
 
 /** Narrow a declared MIME string to the durable image vocabulary. */

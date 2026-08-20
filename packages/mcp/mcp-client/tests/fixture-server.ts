@@ -30,6 +30,16 @@ server.registerTool('greet', {
   content: [{ type: 'text', text: `Hello, ${args.name}!` }],
 }))
 
+server.registerTool('inspect', {
+  title: 'Inspect Tool',
+  description: 'Returns a concise status and structured details.',
+  inputSchema: {},
+  outputSchema: { answer: z.number(), state: z.string() },
+}, async () => ({
+  content: [{ type: 'text', text: 'inspect ok' }],
+  structuredContent: { answer: 42, state: 'ready' },
+}))
+
 server.registerTool('fail', {
   title: 'Fail Tool',
   description: 'Always returns an error.',

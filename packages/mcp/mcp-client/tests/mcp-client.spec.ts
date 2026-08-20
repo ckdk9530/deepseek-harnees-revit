@@ -5,6 +5,9 @@ import { Context } from '@deepseek-ai/cordis'
 import AttachmentStore, { AttachmentError, AttachmentId } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentLimits, ImageAttachmentRef, SaveImageAttachment, StoredImageAttachment } from '@deepseek-ai/dsh-attachment'
 import { CallId, LlmAdapter, LlmRuntime } from '@deepseek-ai/dsh-llm'
+import SpillStore, { SpillLocator } from '@deepseek-ai/dsh-spill'
+import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
@@ -103,6 +106,22 @@ class RecordingAttachmentStore extends AttachmentStore {
   }
 }
 
+/** Spill fake that records full structured JSON persisted by an expanded MCP result. */
+class RecordingSpillStore extends SpillStore {
+  readonly saved: SaveTextSpill[] = []
+  reject = false
+
+  saveText(input: SaveTextSpill): Promise<SpillRef> {
+    this.saved.push(input)
+    if (this.reject) return Promise.reject(new Error('disk full'))
+    return Promise.resolve({
+      locator: SpillLocator('/private/mcp-structured.json'),
+      bytes: Buffer.byteLength(input.content, 'utf8'),
+      retrievalHint: 'Use read with offset and limit.',
+    })
+  }
+}
+
 /** Exact-route fake used only for image-capability admission. */
 class ImageCatalogAdapter extends LlmAdapter {
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
@@ -145,6 +164,7 @@ function textAt(content: readonly ContentBlock[], index = 0): string {
 const defaultOpts: ToolBridgeOptions = {
   registrationFailure: 'contain',
   serverName: 'srv',
+  structuredContentMaxInlineBytes: 16_384,
   toolCallTimeoutMs: 60_000,
 }
 
@@ -200,6 +220,61 @@ describe('syncTools', () => {
     // Raw names are NOT registered.
     expect(ctx.tools.get('greet')).toBeUndefined()
     expect(ctx.tools.get('add')).toBeUndefined()
+  })
+
+  it('adds a host-only responseDetail choice without replacing server parameters', async () => {
+    const client = createMockClient([{
+      name: 'inspect',
+      inputSchema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { elementId: { type: 'string' } },
+        required: ['elementId'],
+      },
+    }])
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+
+    expect(ctx.tools.get('mcp__srv__inspect')?.parameters).toEqual({
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        elementId: { type: 'string' },
+        responseDetail: {
+          type: 'string',
+          enum: ['summary', 'full'],
+          description: 'Choose full when the task needs the complete structured result; summary keeps the server\'s normal concise result.',
+        },
+      },
+      required: ['elementId'],
+    })
+  })
+
+  it('uses a deterministic fallback name when the server owns responseDetail', async () => {
+    const client = createMockClient([{
+      name: 'colliding',
+      inputSchema: { type: 'object', properties: { responseDetail: { type: 'boolean' } } },
+    }])
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+
+    expect(ctx.tools.get('mcp__srv__colliding')?.parameters).toMatchObject({
+      properties: {
+        responseDetail: { type: 'boolean' },
+        responseDetail2: { type: 'string', enum: ['summary', 'full'] },
+      },
+    })
+    await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('collision'),
+      name: 'mcp__srv__colliding',
+      arguments: { responseDetail: true, responseDetail2: 'summary' },
+    })
+    expect(client.callTool).toHaveBeenCalledWith(
+      { name: 'colliding', arguments: { responseDetail: true } },
+      undefined,
+      expect.anything(),
+    )
   })
 
   it('lets two servers publish the same raw name side by side', async () => {
@@ -409,6 +484,190 @@ describe('tool execution', () => {
       { name: 'echo', arguments: { msg: 'hi' } },
       undefined,
       expect.objectContaining({ timeout: 60_000 }),
+    )
+  })
+
+  it('projects structuredContent on demand and strips the host-only argument from the wire call', async () => {
+    const structuredContent = { answer: 42, nested: { ready: true } }
+    const client = createMockClient(
+      [{ name: 'inspect', inputSchema: { type: 'object', properties: { query: { type: 'string' } } } }],
+      { content: [{ type: 'text', text: 'inspect ok' }], structuredContent },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('full-1'),
+      name: 'mcp__srv__inspect',
+      arguments: { query: 'current model', responseDetail: 'full' },
+    })
+
+    expect(result.isError).toBe(false)
+    expect(result.content).toEqual([
+      { type: 'text', text: 'inspect ok' },
+      {
+        type: 'text',
+        text: 'Structured MCP result:\n```json\n{\n  "answer": 42,\n  "nested": {\n    "ready": true\n  }\n}\n```',
+      },
+    ])
+    if (result.isError) throw new Error('expected MCP success')
+    expect(result.value).toEqual({ content: [{ type: 'text', text: 'inspect ok' }], structuredContent })
+    expect(client.callTool).toHaveBeenCalledWith(
+      { name: 'inspect', arguments: { query: 'current model' } },
+      undefined,
+      expect.anything(),
+    )
+  })
+
+  it('projects structured content from a legacy MCP result when full detail is requested', async () => {
+    const client = createMockClient([{ name: 'legacy-full', inputSchema: { type: 'object' } }])
+    client.callTool.mockResolvedValue({ toolResult: { status: 'ok' }, structuredContent: { answer: 42 } })
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('legacy-full'),
+      name: 'mcp__srv__legacy-full',
+      arguments: { responseDetail: 'full' },
+    })
+
+    expect(result.content).toEqual([
+      { type: 'text', text: '{"status":"ok"}' },
+      { type: 'text', text: 'Structured MCP result:\n```json\n{\n  "answer": 42\n}\n```' },
+    ])
+  })
+
+  it('keeps structuredContent out of summary results', async () => {
+    const client = createMockClient(
+      [{ name: 'inspect', inputSchema: { type: 'object' } }],
+      { content: [{ type: 'text', text: 'inspect ok' }], structuredContent: { answer: 42 } },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('summary-1'),
+      name: 'mcp__srv__inspect',
+      arguments: { responseDetail: 'summary' },
+    })
+
+    expect(result.content).toEqual([{ type: 'text', text: 'inspect ok' }])
+    expect(client.callTool).toHaveBeenCalledWith(
+      { name: 'inspect', arguments: {} },
+      undefined,
+      expect.anything(),
+    )
+  })
+
+  it('bounds an expanded structured result when no spill store is available', async () => {
+    const client = createMockClient(
+      [{ name: 'large', inputSchema: { type: 'object' } }],
+      { content: [{ type: 'text', text: 'large ok' }], structuredContent: { value: 'x'.repeat(2_000) } },
+    )
+    const maxBytes = 320
+
+    await syncTools(client as never, ctx, { ...defaultOpts, structuredContentMaxInlineBytes: maxBytes }, new Map())
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('large-1'),
+      name: 'mcp__srv__large',
+      arguments: { responseDetail: 'full' },
+    })
+
+    expect(result.content).toHaveLength(2)
+    expect(Buffer.byteLength(textAt(result.content, 1), 'utf8')).toBeLessThanOrEqual(maxBytes)
+    expect(textAt(result.content, 1)).toContain('Structured MCP result preview')
+    expect(textAt(result.content, 1)).toContain('full value remains available only to programmatic callers')
+  })
+
+  it('keeps even the truncation notice inside a tiny programmatic projection budget', async () => {
+    const client = createMockClient(
+      [{ name: 'tiny', inputSchema: { type: 'object' } }],
+      { content: [{ type: 'text', text: 'tiny ok' }], structuredContent: { value: 'x'.repeat(2_000) } },
+    )
+    const maxBytes = 32
+
+    await syncTools(client as never, ctx, { ...defaultOpts, structuredContentMaxInlineBytes: maxBytes }, new Map())
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('tiny-1'),
+      name: 'mcp__srv__tiny',
+      arguments: { responseDetail: 'full' },
+    })
+
+    expect(Buffer.byteLength(textAt(result.content, 1), 'utf8')).toBeLessThanOrEqual(maxBytes)
+  })
+
+  it('spills oversized structured JSON and gives the model a retrieval path', async () => {
+    const spillCtx = await mountRegistry()
+    await spillCtx.plugin(RecordingSpillStore)
+    const spillStore = spillCtx.spillStore as RecordingSpillStore
+    const structuredContent = { value: 'x'.repeat(2_000) }
+    const client = createMockClient(
+      [{ name: 'large', inputSchema: { type: 'object' } }],
+      { content: [{ type: 'text', text: 'large ok' }], structuredContent },
+    )
+
+    await syncTools(client as never, spillCtx, { ...defaultOpts, structuredContentMaxInlineBytes: 380 }, new Map())
+    const result = await spillCtx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('large-spill-1'),
+      name: 'mcp__srv__large',
+      arguments: { responseDetail: 'full' },
+      agent: { session: { header: { id: SessionId('mcp-spill') } } } as never,
+    })
+
+    expect(spillStore.saved).toHaveLength(1)
+    expect(spillStore.saved[0]).toMatchObject({
+      owner: { sessionId: SessionId('mcp-spill') },
+      source: { toolName: 'mcp__srv__large', callId: CallId('large-spill-1'), label: 'structuredContent' },
+      suggestedName: 'large.structured.json',
+      content: JSON.stringify(structuredContent, null, 2),
+    })
+    expect(textAt(result.content, 1)).toContain('/private/mcp-structured.json')
+    expect(textAt(result.content, 1)).toContain('Use read with offset and limit.')
+  })
+
+  it('keeps a successful result usable when structured spill storage rejects it', async () => {
+    const spillCtx = await mountRegistry()
+    await spillCtx.plugin(RecordingSpillStore)
+    const spillStore = spillCtx.spillStore as RecordingSpillStore
+    spillStore.reject = true
+    const client = createMockClient(
+      [{ name: 'large', inputSchema: { type: 'object' } }],
+      { content: [{ type: 'text', text: 'large ok' }], structuredContent: { value: 'x'.repeat(2_000) } },
+    )
+
+    await syncTools(client as never, spillCtx, { ...defaultOpts, structuredContentMaxInlineBytes: 320 }, new Map())
+    const result = await spillCtx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('large-spill-fail'),
+      name: 'mcp__srv__large',
+      arguments: { responseDetail: 'full' },
+      agent: { session: { header: { id: SessionId('mcp-spill-fail') } } } as never,
+    })
+
+    expect(result.isError).toBe(false)
+    expect(spillStore.saved).toHaveLength(1)
+    expect(textAt(result.content, 1)).toContain('full value remains available only to programmatic callers')
+  })
+
+  it('reports when full detail was requested but the server returned no structured content', async () => {
+    const client = createMockClient(
+      [{ name: 'plain', inputSchema: { type: 'object' } }],
+      { content: [{ type: 'text', text: 'plain ok' }] },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: CallId('full-missing'),
+      name: 'mcp__srv__plain',
+      arguments: { responseDetail: 'full' },
+    })
+
+    expect(textAt(result.content, 1)).toBe(
+      '[structured result unavailable: the MCP server returned no structuredContent]',
     )
   })
 
@@ -1126,6 +1385,7 @@ describe('createTransport', () => {
       env: {},
       cwd: '/tmp',
       toolCallTimeoutMs: 60_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     const transport = createTransport(config)
@@ -1141,6 +1401,7 @@ describe('createTransport', () => {
       url: 'http://localhost:3000/mcp',
       headers: {},
       toolCallTimeoutMs: 60_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     const transport = createTransport(config)
@@ -1156,6 +1417,7 @@ describe('createTransport', () => {
       url: 'http://localhost:3000/mcp',
       headers: { Authorization: 'Bearer token' },
       toolCallTimeoutMs: 60_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     const transport = createTransport(config)
@@ -1180,6 +1442,7 @@ describe('createTransport', () => {
         env: { EXTRA: 'injected' },
         cwd: '',
         toolCallTimeoutMs: 60_000,
+        structuredContentMaxInlineBytes: 16_384,
         failOnStartupError: false,
       }
       // StdioClientTransport keeps its env private; the observable contract is
@@ -1206,6 +1469,7 @@ describe('createTransport', () => {
       env: { CUSTOM: 'value' },
       cwd: '',
       toolCallTimeoutMs: 60_000,
+      structuredContentMaxInlineBytes: 16_384,
       failOnStartupError: false,
     }
     const transport = createTransport(config)

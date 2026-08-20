@@ -20,7 +20,7 @@ Status: implemented
 
 ## 决策
 
-**读取配置与写入配置同样属于特权操作。**`settings.describe` 与 `credentials.describe` 加入仅限回环的集合，因此在真正的认证层出现之前，整个配置面都保持同源。模型目录（`llm.providers`、`llm.models`）刻意不在其中：它携带的是提供方 id、显示名与模型列表——没有端点、没有密钥状态——而 LAN 客户端的模型选择器正需要它。这条边界由一台真实 HTTP 服务器来断言，而不是手工拼装的请求，因为真正决定它的，是浏览器实际发出的那个 `Host` 头。
+**读取配置与写入配置同样属于特权操作。**`settings.describe` 与 `credentials.describe` 加入特权配置集合。该集合默认仅限回环；接受风险的部署可以设置 `allowRemoteConfiguration: true`，把完整的 settings、credentials 与草稿模型发现面授予它声明的 `trustedHosts`。这是可信网络部署选择，不是认证；宿主原生操作与 preset 创作操作仍仅限回环。模型目录（`llm.providers`、`llm.models`）无需 opt-in：它携带的是提供方 id、显示名与模型列表——没有端点、没有密钥状态——而 LAN 客户端的模型选择器正需要它。默认拒绝与显式授予都由真实 HTTP 服务器断言，而不是手工拼装请求，因为真正决定它们的是浏览器实际发出的 `Host` 头。
 
 **这个面恰好服务于已注册模型提供方所指向的那些 namespace。**`ctx.llm.listConfigurableProviders()` 就是允许列表，于是产品边界是被执行的，而不是从今天的插件集合里推断出来的；将来的 namespace 只有加入该目录才会变得可在 Web 上配置。未注册的 namespace 与未暴露的 namespace 得到完全相同的答复（`settings-not-exposed`），因此探测无法枚举注册表。
 
@@ -40,4 +40,4 @@ Status: implemented
 
 ## 影响
 
-`trustedHosts` 部署下的 LAN 客户端已经完全无法渲染设置页；配置表层就是回环。注册了 settings namespace 的插件，在它同时注册可配置提供方之前不会变得可在 Web 上配置——这是刻意的，也正是 `settings-not-exposed` 要在消息里点明这条边界的原因。`SettingsDescriptor` 新增了必填的 `revision`，因此以编程方式构造 descriptor 形状值的地方都必须提供它；`settings/document-updated` 是一个新事件，提供方侧的任何 listener 现在都可以观察它。忽略 `expectedRevision` 的客户端，其后写胜出的语义完全不变。延后事项：fail-closed 的协议 describe（连同它所承载的 `headers` 与信封净化工作），以及一套不含可执行代码的浏览器 schema 协议。
+`trustedHosts` 部署下的 LAN 客户端只有在部署同时启用 `allowRemoteConfiguration` 时才能渲染设置页；默认仍为回环。opt-in 会把脱敏读取、写入、凭据状态、只写凭据输入，以及由调用方指定目标的模型发现暴露给每个可信权威；未声明的权威与宿主原生方法仍得到 403。注册了 settings namespace 的插件无需同时注册可配置提供方即可在 Web 上配置，如上方取代说明所述。`SettingsDescriptor` 带有必填 `revision`，`settings/document-updated` 是提供方侧 listener 可以观察的事件。忽略 `expectedRevision` 的客户端，其后写胜出的语义不变。延后事项：fail-closed 的协议 describe（连同它所承载的 `headers` 与信封净化工作），以及一套不含可执行代码的浏览器 schema 协议。
